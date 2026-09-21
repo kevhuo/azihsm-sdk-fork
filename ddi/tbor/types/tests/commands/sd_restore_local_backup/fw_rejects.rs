@@ -11,23 +11,14 @@ use azihsm_ddi_tbor_types::SessionType;
 use azihsm_ddi_tbor_types::TborSdRestoreLocalBackupReq;
 use azihsm_ddi_tbor_types::TborStatus;
 use azihsm_ddi_tbor_types::MASKED_SD_LEN;
-use azihsm_ddi_tbor_types::PSK_LEN;
 use azihsm_ddi_tbor_types::SD_MK_BACKUP_LEN;
 
 use crate::harness::bootstrap_rotated_co;
 use crate::harness::SessionOpenInitOptions;
 use crate::harness::TestCtx;
+use crate::harness::CU_PSK_ID as CU;
 use crate::harness::ROTATED_CO_PSK;
-
-/// Crypto-User PSK id.
-const CU: u8 = 1;
-
-/// Non-default 32-byte CU PSK, used to clear the default-PSK gate so the
-/// CU-role reject path — not the default-PSK gate — is exercised.
-const ROTATED_CU_PSK: [u8; PSK_LEN] = [
-    0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F,
-    0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F,
-];
+use crate::harness::ROTATED_CU_PSK;
 
 #[test]
 fn sd_restore_local_backup_rejects_before_finalize() {
