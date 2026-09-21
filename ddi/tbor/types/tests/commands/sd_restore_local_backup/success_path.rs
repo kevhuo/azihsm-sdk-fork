@@ -11,14 +11,13 @@ use azihsm_ddi_tbor_types::TborSdRestoreLocalBackupReq;
 use azihsm_ddi_tbor_types::MASKED_SD_LEN;
 use azihsm_ddi_tbor_types::SD_MK_BACKUP_LEN;
 
-use crate::commands::part_init::mach_seed;
-use crate::harness::x509_fixture::CaKey;
-use crate::harness::TestCtx;
-
 use super::assert_refreshed_pair;
 use super::create_sd_on_first_device;
 use super::reboot_and_restore_part_local_mk;
 use super::restore_cycle;
+use crate::commands::part_init::mach_seed;
+use crate::harness::x509_fixture::CaKey;
+use crate::harness::TestCtx;
 
 #[test]
 fn sd_restore_local_backup_roundtrip() {

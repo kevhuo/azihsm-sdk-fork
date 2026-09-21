@@ -15,7 +15,12 @@ use std::sync::Barrier;
 use azihsm_ddi_tbor_types::TborPartInfoReq;
 use azihsm_ddi_tbor_types::TborSdRestoreLocalBackupReq;
 use azihsm_ddi_tbor_types::TborStatus;
+use azihsm_ddi_tbor_types::MASKED_SD_LEN;
+use azihsm_ddi_tbor_types::SD_MK_BACKUP_LEN;
 
+use super::assert_refreshed_pair;
+use super::create_sd_on_first_device;
+use super::reboot_and_restore_part_local_mk;
 use crate::commands::part_init::mach_seed;
 use crate::commands::part_init::pota_thumbprint;
 use crate::commands::sd_create_remote_backup::backing_part_policy;
@@ -30,10 +35,6 @@ use crate::harness::x509_fixture::CaKey;
 use crate::harness::x509_fixture::RAW_PUB_LEN;
 use crate::harness::TestCtx;
 use crate::harness::ROTATED_CO_PSK;
-
-use super::assert_refreshed_pair;
-use super::create_sd_on_first_device;
-use super::reboot_and_restore_part_local_mk;
 
 #[test]
 fn sd_restore_local_backup_is_one_shot() {
@@ -240,4 +241,125 @@ fn sd_restore_local_backup_multi_threaded_single_winner() {
         .expect("checked above")
         .expect("winner is Ok");
     assert_refreshed_pair(&winner.pok_local_backup, &winner.sd_mk_backup);
+}
+
+#[test]
+fn sd_restore_local_backup_rejection_does_not_mutate_partition_state() {
+    // The claim is published by `commit_sd_established_state` before the
+    // response is handed back, so a command that never reaches the commit
+    // must leave the partition exactly as it found it. This reads the
+    // observable lifecycle state either side of a rejection: if a refused
+    // restore advanced it, every later gate would be judging the wrong
+    // state.
+    let seed = mach_seed();
+    let sata = CaKey::generate();
+    let pota = CaKey::generate();
+
+    let created = create_sd_on_first_device(&seed, &sata, &pota);
+    let ctx = TestCtx::new();
+    let session = reboot_and_restore_part_local_mk(&ctx, &seed, &pota, &created);
+
+    let before = ctx
+        .tbor(&TborPartInfoReq::new())
+        .expect("PartInfo before rejection");
+
+    ctx.tbor(&TborSdRestoreLocalBackupReq {
+        session_id: session.session_id,
+        pok_local_backup: vec![0u8; MASKED_SD_LEN],
+        sd_mk_backup: vec![0u8; SD_MK_BACKUP_LEN],
+    })
+    .expect_err("a malformed restore must be rejected");
+
+    let after = ctx
+        .tbor(&TborPartInfoReq::new())
+        .expect("PartInfo after rejection");
+
+    assert_eq!(
+        after.part_state, before.part_state,
+        "a rejected restore must not advance the partition lifecycle state",
+    );
+    assert_eq!(
+        after.generation, before.generation,
+        "a rejected restore must not bump the partition generation",
+    );
+    assert_eq!(
+        after.owner_svn, before.owner_svn,
+        "a rejected restore must not roll the owner seed",
+    );
+}
+
+#[test]
+fn sd_restore_local_backup_multiple_rejections_do_not_consume_the_claim() {
+    // `retry_after_rejected_restore` proves one rejection leaves the claim
+    // intact. This proves it holds across several *distinct* failure
+    // modes in sequence, which is what a partition sees in practice: a
+    // host replaying a stale or corrupted backup pair retries repeatedly,
+    // and the partition must still be restorable afterwards.
+    let seed = mach_seed();
+    let sata = CaKey::generate();
+    let pota = CaKey::generate();
+
+    let created = create_sd_on_first_device(&seed, &sata, &pota);
+    let ctx = TestCtx::new();
+    let session = reboot_and_restore_part_local_mk(&ctx, &seed, &pota, &created);
+
+    let mut tampered_pok = created.pok_local_backup.clone();
+    let last = tampered_pok.len() - 1;
+    tampered_pok[last] ^= 0xFF;
+
+    let mut tampered_sd_mk = created.sd_mk_backup.clone();
+    let last = tampered_sd_mk.len() - 1;
+    tampered_sd_mk[last] ^= 0xFF;
+
+    let attempts: [(Vec<u8>, Vec<u8>); 3] = [
+        (vec![0u8; MASKED_SD_LEN], created.sd_mk_backup.clone()),
+        (tampered_pok, created.sd_mk_backup.clone()),
+        (created.pok_local_backup.clone(), tampered_sd_mk),
+    ];
+
+    for (pok, sd_mk) in attempts {
+        ctx.tbor(&TborSdRestoreLocalBackupReq {
+            session_id: session.session_id,
+            pok_local_backup: pok,
+            sd_mk_backup: sd_mk,
+        })
+        .expect_err("each malformed restore must be rejected");
+    }
+
+    ctx.tbor(&TborSdRestoreLocalBackupReq {
+        session_id: session.session_id,
+        pok_local_backup: created.pok_local_backup.clone(),
+        sd_mk_backup: created.sd_mk_backup.clone(),
+    })
+    .expect("a valid restore must still succeed after repeated rejections");
+}
+
+#[test]
+fn sd_restore_local_backup_session_remains_usable_after_rejection() {
+    // A rejected restore must not tear down the session it arrived on.
+    // The command runs in-session and the dispatcher binds the SQE to the
+    // session id, so a handler that closed or poisoned the slot on the
+    // error path would strand the host with no way to retry.
+    let seed = mach_seed();
+    let sata = CaKey::generate();
+    let pota = CaKey::generate();
+
+    let created = create_sd_on_first_device(&seed, &sata, &pota);
+    let ctx = TestCtx::new();
+    let session = reboot_and_restore_part_local_mk(&ctx, &seed, &pota, &created);
+
+    ctx.tbor(&TborSdRestoreLocalBackupReq {
+        session_id: session.session_id,
+        pok_local_backup: vec![0u8; MASKED_SD_LEN],
+        sd_mk_backup: vec![0u8; SD_MK_BACKUP_LEN],
+    })
+    .expect_err("a malformed restore must be rejected");
+
+    // Same session, valid request: proves the slot is still Active.
+    ctx.tbor(&TborSdRestoreLocalBackupReq {
+        session_id: session.session_id,
+        pok_local_backup: created.pok_local_backup.clone(),
+        sd_mk_backup: created.sd_mk_backup.clone(),
+    })
+    .expect("the session must still serve a valid restore after a rejection");
 }
