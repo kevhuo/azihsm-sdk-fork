@@ -3,7 +3,7 @@
 
 //! `SdRestoreLocalBackup` write-once claim.
 //!
-//! `sd_kmk_id` is the sole completion witness, published before the
+//! `SD_MK_KEY_ID` is the sole completion witness, published before the
 //! response is handed back, so a second restore on the same incarnation
 //! is refused. These tests pin all four consequences: the direct second
 //! attempt, a replayed request after a delivered success, concurrent
@@ -36,15 +36,15 @@ use crate::harness::x509_fixture::RAW_PUB_LEN;
 use crate::harness::TestCtx;
 use crate::harness::ROTATED_CO_PSK;
 
+/// A device that has just created its SD is already SD-initialized, so a
+/// local restore on the same incarnation must be refused by the one-shot
+/// gate with [`TborStatus::SdAlreadyInitialized`].
 #[test]
 fn sd_restore_local_backup_is_one_shot() {
     let seed = mach_seed();
     let sata = CaKey::generate();
     let pota = CaKey::generate();
 
-    // A single device that has just created its SD is already
-    // SD-initialized, so a local restore on the same incarnation is
-    // rejected by the one-shot gate.
     let ctx = TestCtx::new();
     let session = bootstrap_rotated_co(&ctx, &ROTATED_CO_PSK);
     let info = ctx.tbor(&TborPartInfoReq::new()).expect("PartInfo");
@@ -80,6 +80,14 @@ fn sd_restore_local_backup_is_one_shot() {
     );
 }
 
+/// A host that loses the reply cannot reissue the command: state commits
+/// before the response is delivered, so the retry sees an initialized
+/// domain and gets [`TborStatus::SdAlreadyInitialized`].
+///
+/// That is deliberate, not an oversight -- see
+/// `docs/tbor-ddi/commands/sd_restore_local_backup.md`. Pinning it here
+/// forces any future move to idempotent replay to revisit this test on
+/// purpose rather than silently change the contract.
 #[test]
 fn sd_restore_local_backup_rejects_replay_after_success() {
     let seed = mach_seed();
@@ -99,13 +107,6 @@ fn sd_restore_local_backup_rejects_replay_after_success() {
     let resp = ctx.tbor(&req).expect("first SdRestoreLocalBackup");
     assert_refreshed_pair(&resp.pok_local_backup, &resp.sd_mk_backup);
 
-    // Persistent state commits before the response is delivered, so a host
-    // that loses the reply cannot simply reissue the command: the retry sees
-    // an initialized domain and is turned away by the one-shot gate. That is
-    // a deliberate limitation rather than an oversight — see "Known
-    // Limitations" in `docs/SdRestoreLocalBackup.md` — and it is asserted
-    // here so any future move to idempotent replay has to revisit this test
-    // on purpose instead of silently changing the contract.
     ctx.expect_fw_reject(
         &TborSdRestoreLocalBackupReq {
             session_id: session.session_id,
@@ -116,6 +117,14 @@ fn sd_restore_local_backup_rejects_replay_after_success() {
     );
 }
 
+/// A rejected attempt must leave the claim unconsumed, so a valid retry
+/// on the same session still succeeds.
+///
+/// `SD_MK_KEY_ID` is published only once the command is past every unmask
+/// and has its response encoded, so a failure this early can never mark
+/// the domain initialized. Were that ordering to regress, the retry below
+/// would come back [`TborStatus::SdAlreadyInitialized`] and the device
+/// would be unrecoverable in the field after a single malformed request.
 #[test]
 fn sd_restore_local_backup_retry_after_rejected_restore() {
     let seed = mach_seed();
@@ -140,14 +149,6 @@ fn sd_restore_local_backup_retry_after_rejected_restore() {
         TborStatus::AesGcmDecryptTagDoesNotMatch,
     );
 
-    // The same session then restores successfully from sound inputs. A
-    // rejected attempt must leave the partition exactly as it found it:
-    // `sd_kmk_id` -- the only witness that a domain exists -- is published
-    // once the command is past every unmask and has its response encoded, so
-    // a failure this early can never mark the domain as initialized. Were
-    // that ordering to regress, the retry below would come back
-    // `SdAlreadyInitialized` and the device would be unrecoverable in the
-    // field after a single malformed request.
     let resp = ctx
         .tbor(&TborSdRestoreLocalBackupReq {
             session_id: session.session_id,
@@ -161,17 +162,12 @@ fn sd_restore_local_backup_retry_after_rejected_restore() {
 /// Sixteen threads share one CO session and race `SdRestoreLocalBackup`
 /// on a freshly recovered device.
 ///
-/// Exactly one may restore the security domain. Every other request must
-/// be rejected with `SdAlreadyInitialized` by the `sd_initialized()` gate
-/// in `on_start`, which is authoritative because `commit_sd_restore_state`
-/// publishes `sd_kmk_id` before the winner's response is handed back.
-///
-/// This is the `SdRestoreLocalBackup` counterpart of
-/// `part_final::part_final_multi_threaded_single_winner`, and the
-/// concurrency counterpart of `sd_restore_local_backup_is_one_shot`. It
-/// pins the write-once property at the partition state rather than at any
-/// in-FSM flag, which is what allowed the command's transaction struct to
-/// be removed.
+/// Exactly one may restore the security domain; every other request must
+/// get [`TborStatus::SdAlreadyInitialized`] from the `sd_initialized()`
+/// gate in `on_start`, which is authoritative because
+/// `commit_sd_restore_state` publishes `SD_MK_KEY_ID` before the winner's
+/// response is handed back. The claim is therefore held by partition
+/// state rather than an in-FSM flag.
 #[test]
 fn sd_restore_local_backup_multi_threaded_single_winner() {
     const THREAD_COUNT: usize = 16;
@@ -180,10 +176,8 @@ fn sd_restore_local_backup_multi_threaded_single_winner() {
     let sata = CaKey::generate();
     let pota = CaKey::generate();
 
-    // Device 1: finalize + CreateSD, capturing the local backups.
     let created = create_sd_on_first_device(&seed, &sata, &pota);
 
-    // Device 2 (reboot): restore PartLocalMK so the SD restore can run.
     let ctx = TestCtx::new();
     let session = reboot_and_restore_part_local_mk(&ctx, &seed, &pota, &created);
     let barrier = Barrier::new(THREAD_COUNT);
@@ -232,9 +226,9 @@ fn sd_restore_local_backup_multi_threaded_single_winner() {
         assert_fw_rejects(&err, TborStatus::SdAlreadyInitialized);
     }
 
-    // The winner's own output must still be well-formed: a loser that
-    // wrongly reached the staging path would have run rollback and torn
-    // down the security domain the winner just published.
+    // The winner's output must still be well-formed: a loser that wrongly
+    // reached the staging path would have run rollback and torn down the
+    // security domain the winner just published.
     let winner = winners
         .into_iter()
         .next()
@@ -243,14 +237,16 @@ fn sd_restore_local_backup_multi_threaded_single_winner() {
     assert_refreshed_pair(&winner.pok_local_backup, &winner.sd_mk_backup);
 }
 
+/// A rejected restore must leave the observable partition state exactly
+/// as it found it.
+///
+/// `commit_sd_established_state` publishes the claim before the response
+/// is handed back, so a command that never reaches the commit must not
+/// advance the lifecycle state, bump the generation, or roll the owner
+/// seed. If a refused restore moved any of them, every later gate would
+/// be judging the wrong state.
 #[test]
 fn sd_restore_local_backup_rejection_does_not_mutate_partition_state() {
-    // The claim is published by `commit_sd_established_state` before the
-    // response is handed back, so a command that never reaches the commit
-    // must leave the partition exactly as it found it. This reads the
-    // observable lifecycle state either side of a rejection: if a refused
-    // restore advanced it, every later gate would be judging the wrong
-    // state.
     let seed = mach_seed();
     let sata = CaKey::generate();
     let pota = CaKey::generate();
@@ -288,13 +284,12 @@ fn sd_restore_local_backup_rejection_does_not_mutate_partition_state() {
     );
 }
 
+/// Three distinct failure modes in sequence, then a valid restore.
+///
+/// The one-shot claim must survive a run of rejections, which is what a
+/// partition sees when a host replays a stale or corrupted backup pair.
 #[test]
 fn sd_restore_local_backup_multiple_rejections_do_not_consume_the_claim() {
-    // `retry_after_rejected_restore` proves one rejection leaves the claim
-    // intact. This proves it holds across several *distinct* failure
-    // modes in sequence, which is what a partition sees in practice: a
-    // host replaying a stale or corrupted backup pair retries repeatedly,
-    // and the partition must still be restorable afterwards.
     let seed = mach_seed();
     let sata = CaKey::generate();
     let pota = CaKey::generate();
@@ -334,12 +329,13 @@ fn sd_restore_local_backup_multiple_rejections_do_not_consume_the_claim() {
     .expect("a valid restore must still succeed after repeated rejections");
 }
 
+/// A rejected restore must not tear down the session it arrived on.
+///
+/// The command runs in-session and the dispatcher binds the SQE to the
+/// session id, so a handler that closed or poisoned the slot on the error
+/// path would strand the host with no way to retry.
 #[test]
 fn sd_restore_local_backup_session_remains_usable_after_rejection() {
-    // A rejected restore must not tear down the session it arrived on.
-    // The command runs in-session and the dispatcher binds the SQE to the
-    // session id, so a handler that closed or poisoned the slot on the
-    // error path would strand the host with no way to retry.
     let seed = mach_seed();
     let sata = CaKey::generate();
     let pota = CaKey::generate();

@@ -1,18 +1,21 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! `SdRestoreLocalBackup` envelope rejects.
+//! `SdRestoreLocalBackup` envelope rejects: malformed or tampered
+//! `pok_local_backup` / `sd_mk_backup`.
 //!
-//! These are the cases that must reach the unmask with something for it
-//! to refuse. The two backups travel different routes into the command --
-//! `pok_local_backup` opens under the vaulted `PartLocalMK`, `sd_mk_backup`
-//! under an SDBMK the command first has to derive -- so tamper detection
-//! on one says nothing about the other, and both are covered.
+//! The two backups reach the parser by different routes --
+//! `pok_local_backup` opens under the vaulted `PartLocalMK`,
+//! `sd_mk_backup` under an SDBMK the command must first derive -- so
+//! tamper detection on one says nothing about the other. Both are
+//! covered. Every test here runs against a finalized partition so the
+//! lifecycle gate cannot mask the result.
 
 use azihsm_ddi_interface::DdiError;
 use azihsm_ddi_tbor_types::TborSdRestoreLocalBackupReq;
 use azihsm_ddi_tbor_types::TborStatus;
 use azihsm_ddi_tbor_types::MASKED_SD_LEN;
+use azihsm_ddi_tbor_types::SD_MK_BACKUP_LEN;
 
 use super::create_sd_on_first_device;
 use super::reboot_and_restore_part_local_mk;
@@ -28,6 +31,10 @@ use crate::harness::SessionHandshake;
 use crate::harness::TestCtx;
 use crate::harness::ROTATED_CO_PSK;
 
+/// Bit-flip the last byte of a valid `pok_local_backup`. AEAD-GCM tag
+/// verification must fail inside `unmask` before any key material is
+/// recovered, and the handler surfaces
+/// [`TborStatus::AesGcmDecryptTagDoesNotMatch`].
 #[test]
 fn sd_restore_local_backup_rejects_tampered_pok() {
     let seed = mach_seed();
@@ -36,8 +43,6 @@ fn sd_restore_local_backup_rejects_tampered_pok() {
 
     let created = create_sd_on_first_device(&seed, &sata, &pota);
 
-    // Device 2 (reboot): restore PartLocalMK, then attempt a restore with a
-    // byte-flipped local backup — the AEAD tag no longer verifies.
     let ctx = TestCtx::new();
     let session = reboot_and_restore_part_local_mk(&ctx, &seed, &pota, &created);
 
@@ -45,9 +50,6 @@ fn sd_restore_local_backup_rejects_tampered_pok() {
     let n = tampered.len();
     tampered[n - 1] ^= 0xFF;
 
-    // A byte-flipped local backup fails the AEAD tag check inside `unmask`;
-    // assert the exact status so the contract is locked in — the command must
-    // not succeed or provision the SD under any other failure mode.
     ctx.expect_fw_reject(
         &TborSdRestoreLocalBackupReq {
             session_id: session.session_id,
@@ -58,6 +60,10 @@ fn sd_restore_local_backup_rejects_tampered_pok() {
     );
 }
 
+/// Bit-flip the last byte of a valid `sd_mk_backup`. It opens under an
+/// SDBMK derived from the recovered BKS3, so the tag check must fail on
+/// that second unmask with
+/// [`TborStatus::AesGcmDecryptTagDoesNotMatch`].
 #[test]
 fn sd_restore_local_backup_rejects_tampered_sd_mk() {
     let seed = mach_seed();
@@ -66,11 +72,6 @@ fn sd_restore_local_backup_rejects_tampered_sd_mk() {
 
     let created = create_sd_on_first_device(&seed, &sata, &pota);
 
-    // The sibling of `rejects_tampered_pok` on the other envelope. The two
-    // backups travel a different route into the command — `pok_local_backup`
-    // opens under the vaulted `PartLocalMK`, `sd_mk_backup` under an SDBMK
-    // the command first has to derive from the recovered BKS3 — so tamper
-    // detection on one says nothing about the other.
     let ctx = TestCtx::new();
     let session = reboot_and_restore_part_local_mk(&ctx, &seed, &pota, &created);
 
@@ -88,6 +89,14 @@ fn sd_restore_local_backup_rejects_tampered_sd_mk() {
     );
 }
 
+/// Backups are bound to the `PartLocalMK` that minted them, not merely to
+/// the platform configuration.
+///
+/// The rebooted device is finalized **without** replaying
+/// `local_mk_backup`, which mints a fresh random `PartLocalMK`. Machine
+/// seed, policy and trust anchors are identical, so the masking-key
+/// identity is the only variable and the unmask must fail with
+/// [`TborStatus::AesGcmDecryptTagDoesNotMatch`].
 #[test]
 fn sd_restore_local_backup_rejects_foreign_part_local_mk() {
     let seed = mach_seed();
@@ -96,12 +105,6 @@ fn sd_restore_local_backup_rejects_foreign_part_local_mk() {
 
     let created = create_sd_on_first_device(&seed, &sata, &pota);
 
-    // Finalize the rebooted device **without** replaying `local_mk_backup`,
-    // which mints a fresh random `PartLocalMK` instead of restoring the
-    // original. Everything else — machine seed, policy, trust anchors — is
-    // identical, so this isolates the masking-key identity as the only
-    // variable and proves the backups are bound to it rather than merely to
-    // the platform configuration.
     let ctx = TestCtx::new();
     let session = bootstrap_rotated_co(&ctx, &ROTATED_CO_PSK);
     let init = ctx
@@ -121,72 +124,46 @@ fn sd_restore_local_backup_rejects_foreign_part_local_mk() {
     );
 }
 
+/// An all-zero buffer of the correct width, tried against each envelope
+/// in turn.
+///
+/// A blob of zeroes clears the decoder's fixed-length gate, so it must be
+/// refused on its contents. Accepts either status in
+/// [`HEADER_FAULT_STATUSES`].
 #[test]
 fn sd_restore_local_backup_rejects_all_zero_envelopes() {
-    let seed = mach_seed();
-    let sata = CaKey::generate();
-    let pota = CaKey::generate();
+    let (ctx, session, created) = restore_ready();
 
-    let created = create_sd_on_first_device(&seed, &sata, &pota);
-
-    // Distinct from the tampered cases: those carry sound metadata and fail
-    // only at the tag check, whereas an all-zero buffer of the correct width
-    // clears the decoder's fixed-length gate and then has to be rejected on
-    // its contents. Runs against a finalized partition so the lifecycle gate
-    // cannot mask the result.
-    //
-    // The backends disagree on the reject reason, so this accepts either
-    // until the SDK contract is settled:
-    //
-    //   mcr-hsm  -> `MaskedKeyDecodeFailed` (0x087000C1). Its own header
-    //               check raises this directly on a bad AEAD magic.
-    //   emulator -> `InvalidArg` (0x08000003). `aead_envelope::read_header`
-    //               returns `Error::InvalidFormat`, which the crate's
-    //               `From<Error> for HsmError` collapses to `InvalidArg`
-    //               along with five other framing faults. Every
-    //               `MaskedKeyDecodeFailed` in `key_masking::aead::unmask`
-    //               sits *after* `aead_open`, so it is unreachable for a
-    //               blob whose header does not parse.
-    //
-    // `InvalidArg` is not a documented outcome for this input: the 0x0D
-    // error table gives it exactly one meaning, "partition is not
-    // `Initialized`", which does not hold here -- a valid restore on the
-    // same partition succeeds immediately afterwards. The five commands
-    // that do document a malformed masked key (`ecc_sign`, `ecdh_derive`,
-    // `hkdf_derive`, `rsa_mod_exp`, `concat_kdf_derive`) all pair
-    // `MaskedKeyDecodeFailed` / `AesGcmDecryptTagDoesNotMatch`; 0x0D
-    // documents neither. Narrow this to that documented pair once the
-    // emulator status or the doc is corrected.
-    let ctx = TestCtx::new();
-    let session = reboot_and_restore_part_local_mk(&ctx, &seed, &pota, &created);
-
-    let err = ctx
-        .tbor(&TborSdRestoreLocalBackupReq {
-            session_id: session.session_id,
-            pok_local_backup: vec![0u8; MASKED_SD_LEN],
-            sd_mk_backup: created.sd_mk_backup.clone(),
-        })
-        .expect_err("an all-zero envelope must be rejected");
-    assert!(
-        matches!(
-            &err,
-            azihsm_ddi_interface::DdiError::TborStatus(s)
-                if *s == TborStatus::MaskedKeyDecodeFailed || *s == TborStatus::InvalidArg
-        ),
-        "expected MaskedKeyDecodeFailed (0x087000C1) or InvalidArg (0x08000003), got {err:?}",
+    // Zeroed POK: refused before `sd_mk_backup` is ever parsed.
+    let err = expect_reject(
+        &ctx,
+        session.session_id,
+        vec![0u8; MASKED_SD_LEN],
+        created.sd_mk_backup.clone(),
     );
+    assert_rejects_one_of(&err, &HEADER_FAULT_STATUSES);
+
+    // Zeroed SDBMK backup behind a valid POK, which is the only way to
+    // reach the second unmask. A rejection does not consume the one-shot
+    // claim, so the same device serves both cases.
+    let err = expect_reject(
+        &ctx,
+        session.session_id,
+        created.pok_local_backup.clone(),
+        vec![0u8; SD_MK_BACKUP_LEN],
+    );
+    assert_rejects_one_of(&err, &HEADER_FAULT_STATUSES);
 }
 
 // ---- envelope wire layout -------------------------------------------
 //
-// Mirrored here rather than imported: the AEAD envelope crate is
-// firmware-side and is not a dependency of this host test crate, so these
-// offsets are themselves part of the wire contract under test.
+// Mirrored rather than imported: the AEAD envelope crate is firmware-side
+// and is not a dependency of this host test crate, so these offsets are
+// themselves part of the wire contract under test.
 // `assert_envelope_layout` re-derives them from a real envelope before
 // every tamper, so a format change fails loudly here instead of silently
-// corrupting the wrong region and passing for the wrong reason. SDK #710
-// moved the metadata region from 96 to 192 bytes; that is the drift this
-// guards against.
+// corrupting the wrong region. SDK #710 moved the metadata region from 96
+// to 192 bytes; that is the drift this guards against.
 
 /// Envelope magic, `FORMAT_TAG` in the firmware envelope crate.
 const ENVELOPE_MAGIC: [u8; 4] = *b"AEAD";
@@ -204,28 +181,26 @@ const AAD_LEN: usize = 192;
 const CIPHERTEXT_OFFSET: usize = AAD_OFFSET + AAD_LEN;
 const TAG_LEN: usize = 16;
 
-/// Refusals for a fault in the 8-byte header, measured on both backends.
+/// Refusals for a fault in the 8-byte header.
 ///
-/// The header is parsed before anything else, so neither backend reaches
-/// the AEAD. mcr-hsm raises `MaskedKeyDecodeFailed` from its own magic /
-/// algorithm / reserved / `aad_len` check; the emulator's envelope crate
-/// raises `Error::InvalidFormat` (or `UnsupportedAlg`, or
-/// `InvalidAadLength`) and its `From<Error> for HsmError` collapses all
-/// six framing faults to `InvalidArg`. Both refuse; only the reported
-/// reason differs. See the all-zero test for the full reasoning and the
-/// open question with the SDK maintainers.
+/// The header is parsed first, so neither backend reaches the AEAD.
+/// mcr-hsm raises [`TborStatus::MaskedKeyDecodeFailed`] from its own
+/// magic / algorithm / reserved / `aad_len` check. The emulator's
+/// `aead_envelope::read_header` returns `Error::InvalidFormat`, and
+/// `From<Error> for HsmError` collapses that and five sibling framing
+/// faults to [`TborStatus::InvalidArg`]. Both refuse; only the reported
+/// reason differs, so the tests accept either.
 const HEADER_FAULT_STATUSES: [TborStatus; 2] =
     [TborStatus::MaskedKeyDecodeFailed, TborStatus::InvalidArg];
 
-/// Refusals for a fault in the metadata region, measured on both backends.
+/// Refusals for a fault in the metadata region.
 ///
-/// This is the documented pair: the five commands that specify a
-/// malformed masked key (`ecc_sign`, `ecdh_derive`, `hkdf_derive`,
-/// `rsa_mod_exp`, `concat_kdf_derive`) all list
-/// `MaskedKeyDecodeFailed / AesGcmDecryptTagDoesNotMatch` on one row.
 /// The metadata is both a parsed structure and the AEAD's AAD, so which
-/// one fires depends only on check order: mcr-hsm validates the metadata
-/// is canonical before opening the AEAD, the emulator opens first.
+/// status fires depends on check order: mcr-hsm validates the metadata
+/// before opening the AEAD, the emulator opens first. The five commands
+/// that specify a malformed masked key (`ecc_sign`, `ecdh_derive`,
+/// `hkdf_derive`, `rsa_mod_exp`, `concat_kdf_derive`) list these two
+/// together on one row.
 const MALFORMED_METADATA_STATUSES: [TborStatus; 2] = [
     TborStatus::MaskedKeyDecodeFailed,
     TborStatus::AesGcmDecryptTagDoesNotMatch,
@@ -271,9 +246,8 @@ fn assert_rejects_one_of(err: &DdiError, expected: &[TborStatus]) {
 /// A second device holding a restored `PartLocalMK`, ready to attempt a
 /// security-domain restore, plus the backups captured from the first.
 ///
-/// Every test below needs the same preamble, and the sweeps need it once
-/// for many requests: a rejected restore does not consume the one-shot
-/// claim, so one device serves a whole matrix (see [`super::one_shot`]).
+/// A rejected restore does not consume the one-shot claim, so one device
+/// can serve many requests.
 fn restore_ready() -> (TestCtx, SessionHandshake, CreatedSd) {
     let seed = mach_seed();
     let sata = CaKey::generate();
@@ -294,10 +268,10 @@ fn expect_reject(ctx: &TestCtx, session_id: u16, pok: Vec<u8>, sd_mk: Vec<u8>) -
     .expect_err("a malformed restore must be rejected")
 }
 
+/// The first gate any envelope parser reaches: a blob of the right width
+/// whose magic does not spell `AEAD` is not an envelope at all.
 #[test]
 fn sd_restore_local_backup_rejects_pok_wrong_magic() {
-    // The first gate any envelope parser reaches. A blob of the right
-    // width whose magic does not spell `AEAD` is not an envelope at all.
     let (ctx, session, created) = restore_ready();
     assert_envelope_layout(&created.pok_local_backup);
 
@@ -310,10 +284,10 @@ fn sd_restore_local_backup_rejects_pok_wrong_magic() {
     assert_rejects_one_of(&err, &HEADER_FAULT_STATUSES);
 }
 
+/// The `alg` byte selects key, IV and tag widths, so an unknown value
+/// leaves the parser unable to locate any other field.
 #[test]
 fn sd_restore_local_backup_rejects_pok_unsupported_algorithm() {
-    // The `alg` byte selects key, IV and tag widths, so an unknown value
-    // leaves the parser unable to locate any other field.
     let (ctx, session, created) = restore_ready();
     assert_envelope_layout(&created.pok_local_backup);
 
@@ -324,10 +298,10 @@ fn sd_restore_local_backup_rejects_pok_unsupported_algorithm() {
     assert_rejects_one_of(&err, &HEADER_FAULT_STATUSES);
 }
 
+/// Reserved must be zero. Accepting a non-zero value would silently
+/// consume wire space a future format revision needs.
 #[test]
 fn sd_restore_local_backup_rejects_pok_nonzero_reserved_byte() {
-    // Reserved must be zero. Accepting a non-zero value would silently
-    // consume wire space a future format revision needs.
     let (ctx, session, created) = restore_ready();
     assert_envelope_layout(&created.pok_local_backup);
 
@@ -338,11 +312,11 @@ fn sd_restore_local_backup_rejects_pok_nonzero_reserved_byte() {
     assert_rejects_one_of(&err, &HEADER_FAULT_STATUSES);
 }
 
+/// `aad_len` positions the ciphertext, so a wrong value slides every
+/// later field. The envelope is a fixed 276 B, so the declared length and
+/// the real one must agree.
 #[test]
 fn sd_restore_local_backup_rejects_pok_wrong_aad_len() {
-    // `aad_len` positions the ciphertext, so a wrong value slides every
-    // subsequent field. The envelope is a fixed 276 B here, meaning the
-    // declared length and the real one must agree.
     let (ctx, session, created) = restore_ready();
     assert_envelope_layout(&created.pok_local_backup);
 
@@ -354,11 +328,12 @@ fn sd_restore_local_backup_rejects_pok_wrong_aad_len() {
     assert_rejects_one_of(&err, &HEADER_FAULT_STATUSES);
 }
 
+/// The IV is not covered by the tag, but changing it changes the
+/// keystream, so the tag no longer verifies. The envelope still parses,
+/// so both backends agree on
+/// [`TborStatus::AesGcmDecryptTagDoesNotMatch`].
 #[test]
 fn sd_restore_local_backup_rejects_pok_tampered_iv() {
-    // The IV is not authenticated by the tag, but changing it changes the
-    // keystream, so the tag no longer verifies. Unlike the header cases
-    // the envelope still parses, so both backends agree on the status.
     let (ctx, session, created) = restore_ready();
     assert_envelope_layout(&created.pok_local_backup);
 
@@ -371,10 +346,10 @@ fn sd_restore_local_backup_rejects_pok_tampered_iv() {
     assert_fw_rejects(&err, TborStatus::AesGcmDecryptTagDoesNotMatch);
 }
 
+/// A flipped ciphertext byte is covered by the tag, so this must fail
+/// authentication rather than decrypt to a corrupted BKS3.
 #[test]
 fn sd_restore_local_backup_rejects_pok_tampered_ciphertext() {
-    // A flipped ciphertext byte is covered by the tag, so this must fail
-    // authentication rather than decrypt to a corrupted BKS3.
     let (ctx, session, created) = restore_ready();
     assert_envelope_layout(&created.pok_local_backup);
 
@@ -387,12 +362,12 @@ fn sd_restore_local_backup_rejects_pok_tampered_ciphertext() {
     assert_fw_rejects(&err, TborStatus::AesGcmDecryptTagDoesNotMatch);
 }
 
+/// The metadata is the AEAD's AAD and also carries the key kind, usage
+/// flags and `{svn, owner}` bindings the command acts on, so it must be
+/// refused whether it is checked as metadata or as AAD. Accepts either
+/// status in [`MALFORMED_METADATA_STATUSES`].
 #[test]
 fn sd_restore_local_backup_rejects_pok_tampered_metadata() {
-    // The metadata is the AEAD's additional authenticated data and also
-    // carries the key kind, usage flags and `{svn, owner}` bindings the
-    // command makes policy decisions on, so it must be refused whether it
-    // is checked as metadata or as AAD.
     let (ctx, session, created) = restore_ready();
     assert_envelope_layout(&created.pok_local_backup);
 
@@ -405,11 +380,10 @@ fn sd_restore_local_backup_rejects_pok_tampered_metadata() {
     assert_rejects_one_of(&err, &MALFORMED_METADATA_STATUSES);
 }
 
+/// Sweep every byte of the 8-byte header. All eight are load-bearing, so
+/// flipping any one of them must be refused.
 #[test]
 fn sd_restore_local_backup_rejects_pok_every_header_byte_tampered() {
-    // Sweep the 8-byte header. Every byte is load-bearing, so flipping
-    // any one of them must be refused -- a parser that ignored, say, the
-    // reserved byte would pass the single-byte tests above and fail here.
     let (ctx, session, created) = restore_ready();
     assert_envelope_layout(&created.pok_local_backup);
 
@@ -424,11 +398,10 @@ fn sd_restore_local_backup_rejects_pok_every_header_byte_tampered() {
     }
 }
 
+/// Sweep every byte of the 16-byte tag. A truncated-tag comparison would
+/// accept a flip in the bytes it stopped checking.
 #[test]
 fn sd_restore_local_backup_rejects_pok_every_tag_byte_tampered() {
-    // Sweep the 16-byte tag. A truncated-tag comparison would accept a
-    // flip in the bytes it stopped checking, which no single-byte test
-    // would catch.
     let (ctx, session, created) = restore_ready();
     assert_envelope_layout(&created.pok_local_backup);
 
@@ -444,11 +417,10 @@ fn sd_restore_local_backup_rejects_pok_every_tag_byte_tampered() {
     }
 }
 
+/// Corrupt the magic of `sd_mk_backup`, which the command parses under a
+/// derived SDBMK. Accepts either status in [`HEADER_FAULT_STATUSES`].
 #[test]
 fn sd_restore_local_backup_rejects_sd_mk_wrong_magic() {
-    // The sibling of `rejects_pok_wrong_magic` on the other envelope.
-    // `sd_mk_backup` is opened under an SDBMK the command first has to
-    // derive, so it reaches the parser by a different route.
     let (ctx, session, created) = restore_ready();
     assert_envelope_layout(&created.sd_mk_backup);
 
@@ -461,10 +433,10 @@ fn sd_restore_local_backup_rejects_sd_mk_wrong_magic() {
     assert_rejects_one_of(&err, &HEADER_FAULT_STATUSES);
 }
 
+/// Reaching the `sd_mk_backup` ciphertext means BKS3 was recovered and
+/// SDBMK derived, so this exercises the second unmask specifically.
 #[test]
 fn sd_restore_local_backup_rejects_sd_mk_tampered_ciphertext() {
-    // Reaching the `sd_mk_backup` ciphertext means BKS3 was recovered and
-    // SDBMK derived, so this exercises the second unmask specifically.
     let (ctx, session, created) = restore_ready();
     assert_envelope_layout(&created.sd_mk_backup);
 
@@ -477,11 +449,11 @@ fn sd_restore_local_backup_rejects_sd_mk_tampered_ciphertext() {
     assert_fw_rejects(&err, TborStatus::AesGcmDecryptTagDoesNotMatch);
 }
 
+/// The same malformed request must report the same status every time. A
+/// status that drifted across attempts would mean the first rejection
+/// left state behind.
 #[test]
 fn sd_restore_local_backup_envelope_rejection_is_repeatable() {
-    // The same malformed request must produce the same status every time.
-    // A status that drifts across attempts would mean the first rejection
-    // left state behind.
     let (ctx, session, created) = restore_ready();
     let tampered = flip_byte(&created.pok_local_backup, 0);
 

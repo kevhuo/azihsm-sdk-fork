@@ -15,12 +15,12 @@
 //! device and holds the process-global lock for the ctx's lifetime, so each
 //! test starts from a pristine `Enabled` partition.
 //!
-//! Recovery spans two devices: a first device finalizes and runs `CreateSD`
-//! (capturing the local backups and the `PartFinal` `local_mk_backup`), then
-//! a second device -- factory-reset, same machine seed -- restores
-//! `PartLocalMK` via `PartFinal` and finally restores the security domain
-//! from the captured backups. The helpers in this module own that sequence
-//! so each submodule can express only what it is testing.
+//! Recovery spans two devices: a first device finalizes and runs
+//! `CreateSD` (capturing the local backups and `PartFinal`'s
+//! `local_mk_backup`), then a second device -- factory-reset, same
+//! machine seed -- restores `PartLocalMK` via `PartFinal` and finally
+//! restores the security domain. The helpers here own that sequence so
+//! each submodule expresses only what it is testing.
 //!
 //! Submodules group tests by what is being exercised:
 //! * [`success_path`] -- the full create -> reboot -> restore round trip,
@@ -70,9 +70,10 @@ struct CreatedSd {
 }
 
 /// Drive device 1: finalize a backing partition, mint the SD via
-/// `CreateSD`, and capture everything device 2 needs to recover.  The
-/// `pota` / `sata` trust anchors and machine `seed` are supplied by the
-/// caller so the second device can re-finalize with an identical policy /
+/// `CreateSD`, and capture everything device 2 needs to recover.
+///
+/// The `pota` / `sata` trust anchors and machine `seed` come from the
+/// caller so device 2 can re-finalize with an identical policy and
 /// certificate chain.
 fn create_sd_on_first_device(seed: &[u8], sata: &CaKey, pota: &CaKey) -> CreatedSd {
     let ctx = TestCtx::new();
@@ -137,11 +138,10 @@ fn reboot_and_restore_part_local_mk(
 
 /// Run one full recovery cycle on a factory-reset device: restore
 /// `PartLocalMK` from `created`, then restore the security domain from
-/// the supplied backup pair, returning the **refreshed** pair the command
-/// mints.
+/// the supplied backup pair, returning the **refreshed** pair.
 ///
-/// Owning the `TestCtx` here keeps each cycle's device state — and the
-/// process-global test lock — scoped to the cycle, so a caller can chain
+/// Owning the `TestCtx` here scopes each cycle's device state -- and the
+/// process-global test lock -- to the cycle, so a caller can chain
 /// several without holding a stale handle across a factory reset.
 fn restore_cycle(
     seed: &[u8],
